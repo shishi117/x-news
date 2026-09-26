@@ -166,6 +166,11 @@ LLM_REASONING_HEADROOM = 1500   # 推論モデル向けに上乗せする出力�
 LLM_REASONING_EFFORT = "low"    # 分類・翻訳なので深い推論は不要
 LLM_MAX_RETRY = 6            # 429/5xx のリトライ回数
 LLM_MAX_WAIT = 900           # 1回の待機の上限(秒)。これを超える指示が来たら諦めて例外
+# ★1件ずつ問い合わせるとRPM(リクエスト数)上限に真っ先に当たり、待ち時間が支配的になる。
+#   複数件をまとめて1回のAPI呼び出しで処理し、呼び出し回数そのものを減らす。
+#   バッチ呼び出しが失敗した場合は半分に分割して再試行し、1件まで割ってもだめなら
+#   個別処理（中国語再試行つき）にフォールバックする（normalize_labelsと同じ考え方）。
+ENRICH_BATCH_SIZE = int(cfg_get(_CFG, "llm", "batch_size") or 10)   # config.iniで上書き可
 
 # ---- 認証済みセッション（捨て垢）フォールバック ------------------------------
 # ★財経速報系(financialjuice/DeItaone)はゲストAPIだと古いキャッシュしか返らない実測
@@ -620,6 +625,36 @@ def enrich_prompt(text, retry_hint=""):
             f"{retry_hint}")
 
 
+ENRICH_BATCH_SYS = ("あなたは日本語専門のニュース編集者です。複数の英語ツイートをまとめて"
+                    "処理します。各ツイートを日本語だけに訳し、ラベルを付けます。"
+                    "中国語（簡体字・繁体字）や英語を一切混ぜないでください。"
+                    "JSONのみを返し、前後に一切の文字を出力しないでください。")
+
+
+def enrich_batch_prompt(items):
+    """複数ツイートをまとめて処理させるプロンプト（items=[(tweet_id, text), ...]）。
+    tweet_idをキーにしたJSONオブジェクトで結果を返させる。1件ずつの enrich_prompt と
+    ルールは同じだが、件数ぶん繰り返さないよう説明は1回だけ書く。"""
+    axes_list = "、".join(LABEL_AXES)
+    example = ", ".join(f'"{a}":"…"' for a in LABEL_AXES)
+    body = json.dumps({str(tid): text for tid, text in items}, ensure_ascii=False, indent=None)
+    return (f"次の{len(items)}件のツイートを1件ずつ処理してJSONで返してください。\n"
+            f"- translation: 全文の自然な【日本語】訳（既に日本語ならそのまま）。"
+            f"中国語には絶対にしないこと\n"
+            f"- labels: 次の軸それぞれについて、短い値（日本語・目安10文字以内）を"
+            f"付けたオブジェクト: {axes_list}\n"
+            f"  - 該当が無い軸は必ず「なし」と書く。'-' '—' '…' '無' '？' などの記号や"
+            f"省略表現は使わない\n"
+            f"  - 値は必ず日本語。国名・企業名も日本語表記にする"
+            f"（Venezuela→ベネズエラ、中国人民银行→中国人民銀行）\n"
+            f"  - その軸に当てはまらない値を入れない"
+            f"（例:「国・地域」に『為替』『金融』のような語を入れない）\n\n"
+            f"ツイート一覧（キーはID。**全キーぶん必ず回答すること**）:\n{body}\n\n"
+            f'出力形式（キーは入力と同じID文字列。中身は無関係な見本）: '
+            f'{{"items":{{"<id>":{{"translation":"{_JA_EXAMPLE_TRANSLATION}",'
+            f'"labels":{{{example}}}}}}}}}')
+
+
 # 簡体字にしか存在せず日本語では使わない漢字（強い中国語シグナル。誤検知しにくい厳選セット）
 _SIMPLIFIED_CHINESE_ONLY = set("们这个说没还来现实吗吧啊呢")
 _HIRAGANA_KATAKANA_RE = re.compile(r"[\u3040-\u30ff]")
@@ -737,9 +772,13 @@ def list_models(opener=None):
     return sorted(m.get("id", "") for m in (data.get("data") or []) if m.get("id"))
 
 
-def llm_chat(messages, max_tokens=300, limiter=None, opener=None, sleeper=time.sleep):
+def llm_chat(messages, max_tokens=300, limiter=None, opener=None, sleeper=time.sleep,
+             est_items=1):
     """Groq の OpenAI互換 /chat/completions を叩く（依存を増やさずurllibで直叩き）。
     max_tokens は用途で変える（翻訳=300 / ラベル正規化=長いJSONを返すのでもっと大きく）。
+    est_items はこの1回の呼び出しで処理する件数（バッチ処理時）。出力トークンの
+    事前見積り（_observed_output()は1件あたりの実測平均）をこれに応じて倍にし、
+    レート制限の見積りがバッチ時に過小評価されないようにする。
 
     無料枠向けに以下を行う:
       - 送信前にレート制限内へ収まるまで待つ（RateLimiter）
@@ -770,7 +809,7 @@ def llm_chat(messages, max_tokens=300, limiter=None, opener=None, sleeper=time.s
     # 入力は4文字≒1トークンで概算。出力は「実測の平均」を使う（予算全部を使うわけではない
     # ため、budgetで見積もるとレート制限が過剰に効いて極端に遅くなる）。
     in_tokens = int(sum(len(m.get("content", "")) for m in messages) / 4)
-    est = in_tokens + min(_observed_output(), budget)
+    est = in_tokens + min(_observed_output() * max(1, est_items), budget)
     last_err = None
     for attempt in range(LLM_MAX_RETRY + 1):
         limiter.acquire(est)
@@ -855,51 +894,122 @@ def parse_enrich(raw, orig):
     return {"translation": (o.get("translation") or orig).strip(), "labels": labels}
 
 
+def parse_enrich_batch(raw, items):
+    """バッチ応答(items=[(tweet_id, text), ...])を解釈し、tweet_id(文字列)→結果 の
+    dictを返す。回答漏れ・JSON崩れ・翻訳欠落の項目は結果に含めない
+    （呼び出し元が個別に enrich_one へフォールバックする＝欠測のまま握りつぶさない）。"""
+    s = raw.strip()
+    if "{" in s and "}" in s:
+        s = s[s.find("{"):s.rfind("}") + 1]
+    try:
+        o = json.loads(s)
+    except Exception:
+        o = {}
+    items_in = o.get("items") if isinstance(o.get("items"), dict) else {}
+    out = {}
+    for tid, _text in items:
+        got = items_in.get(str(tid))
+        if not isinstance(got, dict):
+            continue                     # 回答漏れ → フォールバック対象
+        translation = got.get("translation")
+        if not isinstance(translation, str) or not translation.strip():
+            continue                     # 翻訳が空/型違い → フォールバック対象
+        labels_in = got.get("labels") if isinstance(got.get("labels"), dict) else {}
+        labels = {axis: str(labels_in.get(axis) or "不明").strip() for axis in LABEL_AXES}
+        out[str(tid)] = {"translation": translation.strip(), "labels": labels}
+    return out
+
+
 MAX_LANG_RETRIES = 2   # 中国語混入時、初回にプラスして最大この回数だけその場で訳し直す
+
+
+def enrich_one(chat_fn, tid, text):
+    """1件ぶんの翻訳＋全軸のラベル付与（中国語再試行つき）。
+    バッチ処理からのフォールバック先として使う共通処理（元の1件ずつ実装そのもの）。
+    戻り値: (結果dict, 実施したリトライ回数)。直らなければ例外を投げる。"""
+    o, hint, retried = None, "", 0
+    for attempt in range(MAX_LANG_RETRIES + 1):
+        retried = attempt   # attempt=0は初回（リトライではない）。0,1,2=実施済みリトライ回数
+        raw = chat_fn([{"role": "system", "content": ENRICH_SYS},
+                       {"role": "user", "content": enrich_prompt(text, hint)}])
+        o = parse_enrich(raw, text)
+        if not looks_like_chinese(o["translation"]):
+            return o, retried
+        o, hint = None, CHINESE_RETRY_HINT
+    raise ValueError(f"訳文が日本語になりませんでした（中国語混入・{retried}回リトライしても失敗）")
 
 
 def enrich(conn, chat_fn=llm_chat):
     """translation が未設定の行だけ翻訳＋全軸のラベル付与。失敗行は残して次回再試行。
-    訳文が中国語になっていないかを出力後に検証し（looks_like_chinese）、
-    引っかかった場合はプロンプトに念押しを足してその場で訳し直す。
-    MAX_LANG_RETRIES 回試しても直らなければ、既存の失敗行と同様に次回実行へ持ち越す。"""
+
+    ENRICH_BATCH_SIZE件ずつまとめて1回のAPI呼び出しで処理する（RPM上限に真っ先に
+    当たって待ち時間が支配的になるのを避けるため）。バッチ呼び出し自体が失敗したら
+    半分に分割して再試行し、1件まで割ってもだめならenrich_one()（中国語再試行つき）に
+    フォールバックする。バッチ呼び出しが成功しても、回答漏れ・中国語混入の項目だけは
+    その場で個別に立て直す（他の項目の成功を巻き込んで捨てない）。"""
     rows = conn.execute(
         "SELECT tweet_id, summary FROM news_log "
         "WHERE translation IS NULL OR translation = ''").fetchall()
     total = len(rows)
     if total:
-        print(f"[*] 翻訳/ラベリング開始: {total} 件（Groq・1件ずつ）")
-    done, failed = 0, 0
-    for i, (tid, text) in enumerate(rows, 1):
-        t0 = time.time()
-        o, hint, retried = None, "", 0
-        try:
-            for attempt in range(MAX_LANG_RETRIES + 1):
-                retried = attempt   # attempt=0は初回（リトライではない）。0,1,2=実施済みリトライ回数
-                raw = chat_fn([{"role": "system", "content": ENRICH_SYS},
-                               {"role": "user", "content": enrich_prompt(text, hint)}])
-                o = parse_enrich(raw, text)
-                if not looks_like_chinese(o["translation"]):
-                    break
-                o, hint = None, CHINESE_RETRY_HINT
-            if o is None:
-                raise ValueError(
-                    f"訳文が日本語になりませんでした（中国語混入・{retried}回リトライしても失敗）")
-        except Exception as e:
-            failed += 1
-            print(f"    {i}/{total} 失敗 {tid}: {e}")   # 進捗を出す＝無言で固まって見えない
-            continue
+        print(f"[*] 翻訳/ラベリング開始: {total} 件"
+              f"（Groq・{ENRICH_BATCH_SIZE}件ずつバッチ処理、失敗時は自動分割）")
+    counts = {"done": 0, "failed": 0}
+
+    def save(tid, o, note=""):
         conn.execute("UPDATE news_log SET translation=? WHERE tweet_id=?",
                      (o["translation"], tid))
         conn.executemany(
             "INSERT OR REPLACE INTO news_labels (tweet_id, axis, value) VALUES (?,?,?)",
             [(tid, axis, val) for axis, val in o["labels"].items()])
-        conn.commit()
-        done += 1
+        conn.commit()                # ★1件ごとに確定＝途中で中断しても既訳ぶんは残る
+        counts["done"] += 1
         summary = " ".join(f"{a}={v}" for a, v in o["labels"].items())
-        retry_note = f" (中国語再試行{retried}回)" if retried else ""
-        print(f"    {i}/{total} ✓ {time.time() - t0:.1f}s [{summary}]{retry_note}")
-    return done, failed
+        print(f"    {counts['done'] + counts['failed']}/{total} ✓ [{summary}]{note}")
+
+    def fail(tid, err):
+        counts["failed"] += 1
+        print(f"    {counts['done'] + counts['failed']}/{total} 失敗 {tid}: {err}")
+
+    def run_one(tid, text):
+        try:
+            o, retried = enrich_one(chat_fn, tid, text)
+        except Exception as e:
+            fail(tid, e)
+            return
+        note = f" (中国語再試行{retried}回)" if retried else ""
+        save(tid, o, note)
+
+    def run_batch(batch):
+        if not batch:
+            return
+        if len(batch) == 1:
+            run_one(*batch[0])
+            return
+        try:
+            # 出力上限はバッチ件数から見積もる（固定値だと件数が多いとき途中で切れる）
+            budget = min(4000, 220 * len(batch) + 200)
+            raw = chat_fn([{"role": "system", "content": ENRICH_BATCH_SYS},
+                           {"role": "user", "content": enrich_batch_prompt(batch)}],
+                          max_tokens=budget, est_items=len(batch))
+        except Exception as e:
+            print(f"    [WARN] {len(batch)}件のバッチ処理に失敗。分割して再試行します: {e}")
+            half = len(batch) // 2
+            run_batch(batch[:half])
+            run_batch(batch[half:])
+            return
+        parsed = parse_enrich_batch(raw, batch)
+        for tid, text in batch:
+            o = parsed.get(str(tid))
+            if o is None or looks_like_chinese(o["translation"]):
+                run_one(tid, text)       # 回答漏れ/中国語混入ぶんだけ個別に立て直す
+            else:
+                save(tid, o)
+
+    for i in range(0, total, ENRICH_BATCH_SIZE):
+        run_batch(rows[i:i + ENRICH_BATCH_SIZE])
+
+    return counts["done"], counts["failed"]
 
 
 # ---- ラベル正規化（表記ゆれの統一）------------------------------------------
@@ -1599,6 +1709,81 @@ def selftest():
     assert tr4 is None, f"失敗行のtranslationがNULLのままでない（次回再試行できない）: {tr4}"
     conn4.close()
 
+    # ---- enrich のバッチ処理（複数件まとめてのAPI呼び出し）------------------------
+    # parse_enrich_batch: 正常系（全件回答）・回答漏れ・翻訳空欄を区別できるか
+    pb = parse_enrich_batch(
+        json.dumps({"items": {
+            "1": {"translation": "日本語訳1", "labels": {"業界": "金融"}},
+            "3": {"translation": "", "labels": {}},          # 翻訳が空→フォールバック対象
+        }}),
+        [("1", "text1"), ("2", "text2"), ("3", "text3")])
+    assert set(pb) == {"1"}, f"parse_enrich_batchの欠測判定NG: {set(pb)}"
+    assert pb["1"]["labels"]["業界"] == "金融", "parse_enrich_batchのラベル取得NG"
+    assert pb["1"]["labels"]["金融機関"] == "不明", "parse_enrich_batchの未回答軸フォールバックNG"
+
+    # enrich: 複数件を1回のAPI呼び出しでまとめて処理し、レスポンスの回答漏れ・中国語混入
+    # だけは個別に立て直す（他の項目の成功を巻き込んで捨てない）
+    conn5 = init_db(sqlite3.connect(":memory:"))
+    for n in (930, 931, 932):
+        append_rows(conn5, "acc", [{
+            "id": str(n), "author": "acc", "created_at": recent,
+            "text": f"Test tweet {n}", "url": f"https://x.com/acc/status/{n}",
+            "likes": 0, "retweets": 0, "is_rt": False, "is_quote": False}])
+    batch_calls = {"n": 0}
+
+    def fake_partial(msgs, max_tokens=300, est_items=1, **kw):
+        if est_items >= 2:
+            batch_calls["n"] += 1
+            # 930は正常回答／931は回答漏れ／932は中国語混入のまま返す
+            # → 931・932の2件だけがrun_one（個別処理）に回されるはず
+            return json.dumps({"items": {
+                "930": {"translation": "日本語訳930", "labels": {}},
+                "932": {"translation": "联准会维持利率不变", "labels": {}},
+            }}, ensure_ascii=False)
+        return '{"translation":"個別回収した訳文","labels":{"業界":"金融"}}'
+
+    d6, f6 = enrich(conn5, chat_fn=fake_partial)
+    assert (d6, f6) == (3, 0), f"バッチ+個別フォールバックの成功件数NG: {(d6, f6)}"
+    assert batch_calls["n"] == 1, f"バッチ呼び出し回数NG（1回にまとまるはず）: {batch_calls['n']}"
+    tr = {n: conn5.execute(
+        "SELECT translation FROM news_log WHERE tweet_id=?", (str(n),)).fetchone()[0]
+        for n in (930, 931, 932)}
+    assert tr[930] == "日本語訳930", f"バッチ成功ぶんの訳文NG: {tr}"
+    assert tr[931] == "個別回収した訳文", f"回答漏れの個別フォールバックNG: {tr}"
+    assert tr[932] == "個別回収した訳文", f"中国語混入の個別フォールバックNG: {tr}"
+    conn5.close()
+
+    # enrich: バッチ呼び出し自体が失敗（500等）したら半分に分割して再試行し、
+    # 1件まで割ってもだめならenrich_one（中国語再試行つき個別処理）にフォールバックする
+    conn6 = init_db(sqlite3.connect(":memory:"))
+    for n in range(940, 945):        # 5件（ENRICH_BATCH_SIZE=10以下＝最初は1バッチ）
+        append_rows(conn6, "acc", [{
+            "id": str(n), "author": "acc", "created_at": recent,
+            "text": f"Test tweet {n}", "url": f"https://x.com/acc/status/{n}",
+            "likes": 0, "retweets": 0, "is_rt": False, "is_quote": False}])
+    split_sizes = []
+
+    def fake_split(msgs, max_tokens=300, est_items=1, **kw):
+        if est_items >= 2:
+            split_sizes.append(est_items)
+            if est_items >= 3:
+                raise RuntimeError("HTTP Error 500: Internal Server Error")
+            ids = re.findall(r'"(\d+)":\s*"', msgs[1]["content"])
+            items = {tid: {"translation": f"日本語訳{tid}", "labels": {}} for tid in ids}
+            return json.dumps({"items": items}, ensure_ascii=False)
+        return '{"translation":"個別処理での訳文","labels":{"業界":"金融"}}'
+
+    d7, f7 = enrich(conn6, chat_fn=fake_split)
+    assert (d7, f7) == (5, 0), f"分割再試行の成功件数NG: {(d7, f7)}"
+    assert sorted(split_sizes) == [2, 2, 3, 5], f"分割の内訳NG（5→2+3→1+2の想定）: {split_sizes}"
+    tr940 = conn6.execute(
+        "SELECT translation FROM news_log WHERE tweet_id='940'").fetchone()[0]
+    tr942 = conn6.execute(
+        "SELECT translation FROM news_log WHERE tweet_id='942'").fetchone()[0]
+    assert tr940 == "日本語訳940", f"分割後バッチ成功ぶんの訳文NG: {tr940}"
+    assert tr942 == "個別処理での訳文", f"1件まで割った後の個別フォールバックNG: {tr942}"
+    conn6.close()
+
     # parse_enrich フォールバック: 壊れJSON/未回答軸→原文・"不明"で欠測にしない
     o = parse_enrich('{"labels":{"業界":"金融"}}', "orig text")
     assert o["translation"] == "orig text", "翻訳フォールバックNG"
@@ -2081,6 +2266,26 @@ def selftest():
         _record_output(1200)
         assert _observed_output() > base_est, "実測が見積りに反映されていない"
         _OUTPUT_EMA[0] = 400.0
+
+        # ★回帰: est_items（バッチ件数）が大きいほどレート制限の見積りも大きくなる
+        #   （バッチ処理時に見積りを1件ぶんのままにすると、TPM上限を過小評価して429が
+        #   多発する。enrich()のバッチ呼び出しはest_items=バッチ件数を渡す）
+        class _RecordingLimiter(RateLimiter):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.recorded = []
+
+            def acquire(self, est_tokens):
+                self.recorded.append(est_tokens)
+                return super().acquire(est_tokens)
+
+        rlim = _RecordingLimiter(rpm=1000, tpm=10 ** 9, clock=fc4.now, sleeper=fc4.sleep)
+        llm_chat([{"role": "user", "content": "hi"}], limiter=rlim,
+                 opener=capture_opener, sleeper=fc4.sleep, est_items=1)
+        llm_chat([{"role": "user", "content": "hi"}], limiter=rlim,
+                 opener=capture_opener, sleeper=fc4.sleep, est_items=8)
+        assert rlim.recorded[-1] > rlim.recorded[-2], \
+            f"est_itemsがレート見積りに反映されていない: {rlim.recorded}"
 
         # モデル一覧（GET /models）。UAが付くこと・IDだけを取り出すことを確認
         model_headers = {}

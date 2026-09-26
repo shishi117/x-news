@@ -2,6 +2,7 @@
 config/config.ini
 
 # 実行時生成物
+data/
 
 # 仮想環境
 env/
